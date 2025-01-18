@@ -7,10 +7,10 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
-from tqdm import tqdm
+
 # Step 1: Load the training and testing data
-train_file_path = '/public/home/xiangyuduan/kwang/ml/data/train_data.csv'  # 训练集路径
-test_file_path = '/public/home/xiangyuduan/kwang/ml/data/test_data.csv'    # 测试集路径
+train_file_path = '/data/kangw/work/ML/data/train_data.csv'  # 训练集路径
+test_file_path = '/data/kangw/work/ML/data/test_data.csv'    # 测试集路径
 
 train_data = pd.read_csv(train_file_path)
 test_data = pd.read_csv(test_file_path)
@@ -103,7 +103,7 @@ for i in range(n_experiments):
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     
     # Train the model
-    for epoch in tqdm(range(50), desc="Training Epochs", leave=False):  # Number of epochs
+    for epoch in range(10):  # Number of epochs
         model.train()
         for batch_X, batch_y in train_loader:
             batch_X, batch_y = batch_X.to(device), batch_y.to(device)
@@ -161,5 +161,5 @@ plt.xlabel('Time Steps (Hours)', fontsize=14)
 plt.ylabel('Rental Count', fontsize=14)
 plt.legend(fontsize=12)
 plt.grid(True)
-plt.savefig('/public/home/xiangyuduan/kwang/ml/data/LSTM_graph_240h_test.png')
+plt.savefig('/data/kangw/work/ML/data/LSTM_graph_240h_test.png')
 plt.show()

@@ -7,16 +7,17 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
+from tqdm import tqdm
+import math
 
 # Step 1: Load the training and testing data
-train_file_path = '/data/kangw/work/ML/data/train_data.csv'  # 训练集路径
-test_file_path = '/data/kangw/work/ML/data/test_data.csv'    # 测试集路径
+train_file_path = '/public/home/xiangyuduan/kwang/ml/data/train_data.csv'  # 训练集路径
+test_file_path = '/public/home/xiangyuduan/kwang/ml/data/test_data.csv'    # 测试集路径
 
 train_data = pd.read_csv(train_file_path)
 test_data = pd.read_csv(test_file_path)
 
 # Step 2: Data Preprocessing
-# Convert 'dteday' to datetime format and sort by date and hour
 train_data['dteday'] = pd.to_datetime(train_data['dteday'])
 train_data = train_data.sort_values(by=['dteday', 'hr'])
 
@@ -27,33 +28,25 @@ test_data = test_data.sort_values(by=['dteday', 'hr'])
 features = ['season', 'yr', 'mnth', 'hr', 'holiday', 'weekday', 'workingday',
             'weathersit', 'temp', 'atemp', 'hum', 'windspeed', 'cnt']
 
-# Normalize the data using the training data's scaler
+# Normalize the data
 scaler = MinMaxScaler()
 train_data_normalized = pd.DataFrame(scaler.fit_transform(train_data[features]), columns=features)
 test_data_normalized = pd.DataFrame(scaler.transform(test_data[features]), columns=features)
 
 # Step 3: Create Time-Series Sequences
 def create_sequences(data, input_steps, output_steps, feature_column):
-    """
-    Create input-output sequences for time-series forecasting.
-    :param data: Normalized data (DataFrame)
-    :param input_steps: Number of time steps in the input sequence (e.g., 96 hours)
-    :param output_steps: Number of time steps in the output sequence (e.g., 96 or 240 hours)
-    :param feature_column: Column name for the target variable (e.g., 'cnt')
-    :return: Input and output sequences as numpy arrays
-    """
     X, y = [], []
     for i in range(len(data) - input_steps - output_steps):
-        X.append(data.iloc[i:i + input_steps].values)  # Input sequence
-        y.append(data.iloc[i + input_steps:i + input_steps + output_steps][feature_column].values)  # Output sequence
+        X.append(data.iloc[i:i + input_steps].values)
+        y.append(data.iloc[i + input_steps:i + input_steps + output_steps][feature_column].values)
     return np.array(X), np.array(y)
 
 # Parameters
-input_steps = 96  # Past 96 hours
-output_steps = 96  # Short-term prediction (future 96 hours)
+input_steps = 96
+output_steps = 96
 target_column = 'cnt'
 
-# Generate sequences for training and testing
+# Generate sequences
 X_train, y_train = create_sequences(train_data_normalized, input_steps, output_steps, target_column)
 X_test, y_test = create_sequences(test_data_normalized, input_steps, output_steps, target_column)
 
@@ -63,20 +56,64 @@ y_train = torch.tensor(y_train, dtype=torch.float32)
 X_test = torch.tensor(X_test, dtype=torch.float32)
 y_test = torch.tensor(y_test, dtype=torch.float32)
 
-# Define the LSTM model
-class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size, output_steps, num_layers=1):
-        super(LSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
-        self.fc = nn.Linear(hidden_size, output_steps)
+# Positional Encoding
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=0.1)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
 
     def forward(self, x):
-        out, _ = self.lstm(x)  # LSTM output
-        out = self.fc(out[:, -1, :])  # Use the last time step's output
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+# Attention Mechanism
+class Attention(nn.Module):
+    def __init__(self, hidden_size):
+        super(Attention, self).__init__()
+        self.attention = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        attention_weights = torch.softmax(self.attention(x), dim=1)
+        return torch.sum(attention_weights * x, dim=1)
+
+# T-LSTM Model
+class TLSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size, output_steps, num_layers=4, nhead=4):
+        super(TLSTMModel, self).__init__()
+        self.encoder = nn.Linear(input_size, hidden_size)
+        self.pos_encoder = PositionalEncoding(hidden_size)
+        self.transformer = nn.Transformer(
+            d_model=hidden_size,
+            nhead=nhead,
+            num_encoder_layers=num_layers,
+            num_decoder_layers=num_layers,
+            dim_feedforward=hidden_size * 4,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.lstm = nn.LSTM(hidden_size, hidden_size, batch_first=True)
+        self.attention = Attention(hidden_size)
+        self.fc = nn.Linear(hidden_size, output_steps)
+        self.output_steps = output_steps
+    
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.pos_encoder(x)
+        transformer_out = self.transformer(x, x[:, -self.output_steps:, :])
+        lstm_out, _ = self.lstm(transformer_out)
+        attention_out = self.attention(lstm_out)
+        out = self.fc(attention_out)
         return out
 
 # Parameters for experiments
-n_experiments = 10  # Number of experiments
+n_experiments = 5
 mse_results = []
 mae_results = []
 
@@ -90,9 +127,9 @@ for i in range(n_experiments):
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
     
     # Build the model
-    input_size = X_train.shape[2]  # Number of features
-    hidden_size = 64
-    model = LSTMModel(input_size, hidden_size, output_steps)
+    input_size = X_train.shape[2]
+    hidden_size = 128
+    model = TLSTMModel(input_size, hidden_size, output_steps)
     
     # Move model to GPU if available
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -100,11 +137,15 @@ for i in range(n_experiments):
     
     # Define loss and optimizer
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
     
     # Train the model
-    for epoch in range(10):  # Number of epochs
+    train_losses = []
+    val_losses = []
+    for epoch in tqdm(range(50), desc="Training Epochs", leave=False):
         model.train()
+        epoch_loss = 0
         for batch_X, batch_y in train_loader:
             batch_X, batch_y = batch_X.to(device), batch_y.to(device)
             optimizer.zero_grad()
@@ -112,6 +153,30 @@ for i in range(n_experiments):
             loss = criterion(outputs, batch_y)
             loss.backward()
             optimizer.step()
+            epoch_loss += loss.item()
+        train_losses.append(epoch_loss / len(train_loader))
+        
+        # 验证集损失
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch_X, batch_y in test_loader:
+                batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                outputs = model(batch_X)
+                val_loss += criterion(outputs, batch_y).item()
+        val_losses.append(val_loss / len(test_loader))
+        
+        scheduler.step(val_loss)  # 根据验证集损失调整学习率
+    
+    # 绘制训练和验证损失曲线
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Training and Validation Loss')
+    plt.show()
     
     # Evaluate the model on the test set
     model.eval()
@@ -145,22 +210,14 @@ print(f"MSE: Mean = {mse_mean:.4f}, Std = {mse_std:.4f}")
 print(f"MAE: Mean = {mae_mean:.4f}, Std = {mae_std:.4f}")
 
 # 可视化第一个测试样本的真实值和预测值
-
 plt.figure(figsize=(10, 6))
-
-# 提取完整的真实值（0-192 小时）
-# 注意：这里假设 test_data_normalized 是原始测试数据，且已经按时间排序
-true_values = test_data_normalized[target_column].values[:192]  # 提取前 192 小时的真实值
-
-# 绘制真实值（0-192）
+true_values = test_data_normalized[target_column].values[:192]
 plt.plot(range(0, 192), true_values, label='Ground Truth (0-192)', color='blue', linewidth=2)
-
-# 绘制预测值（96-192）
 plt.plot(range(96, 192), y_pred[0], label='Prediction (96-192)', color='orange', linestyle='dashed', linewidth=2)
 plt.title('Bike Rental Prediction vs Ground Truth (96 Hours)', fontsize=16)
 plt.xlabel('Time Steps (Hours)', fontsize=14)
 plt.ylabel('Rental Count', fontsize=14)
 plt.legend(fontsize=12)
 plt.grid(True)
-plt.savefig('/data/kangw/work/ML/data/LSTM_graph_240h_test.png')
+plt.savefig('/data/kangw/work/ML/data/TLSTM_graph_96h_test.png')
 plt.show()

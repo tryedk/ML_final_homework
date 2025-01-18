@@ -8,15 +8,34 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import math
+
+# EarlyStopping类定义
+class EarlyStopping:
+    def __init__(self, patience=5, delta=0):
+        self.patience = patience  # 容忍度
+        self.delta = delta  # 损失的最小改善幅度
+        self.best_loss = float('inf')  # 最好的损失，初始化为无穷大
+        self.counter = 0  # 计数器，用来记录没有改善的次数
+
+    def should_stop(self, val_loss):
+        if val_loss < self.best_loss - self.delta:
+            self.best_loss = val_loss
+            self.counter = 0  # 损失改善，重置计数器
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                return True  # 如果没有改善的次数超过容忍度，返回True，表示停止训练
+        return False  # 继续训练
+
 # Step 1: Load the training and testing data
-train_file_path = '/public/home/xiangyuduan/kwang/ml/data/train_data.csv'  # 训练集路径
-test_file_path = '/public/home/xiangyuduan/kwang/ml/data/test_data.csv'    # 测试集路径
+train_file_path = '/data/kangw/work/ML/data/train_data.csv'  # 训练集路径
+test_file_path = '/data/kangw/work/ML/data/test_data.csv'    # 测试集路径
 
 train_data = pd.read_csv(train_file_path)
 test_data = pd.read_csv(test_file_path)
 
 # Step 2: Data Preprocessing
-# Convert 'dteday' to datetime format and sort by date and hour
 train_data['dteday'] = pd.to_datetime(train_data['dteday'])
 train_data = train_data.sort_values(by=['dteday', 'hr'])
 
@@ -27,30 +46,22 @@ test_data = test_data.sort_values(by=['dteday', 'hr'])
 features = ['season', 'yr', 'mnth', 'hr', 'holiday', 'weekday', 'workingday',
             'weathersit', 'temp', 'atemp', 'hum', 'windspeed', 'cnt']
 
-# Normalize the data using the training data's scaler
+# Normalize the data
 scaler = MinMaxScaler()
 train_data_normalized = pd.DataFrame(scaler.fit_transform(train_data[features]), columns=features)
 test_data_normalized = pd.DataFrame(scaler.transform(test_data[features]), columns=features)
 
 # Step 3: Create Time-Series Sequences
 def create_sequences(data, input_steps, output_steps, feature_column):
-    """
-    Create input-output sequences for time-series forecasting.
-    :param data: Normalized data (DataFrame)
-    :param input_steps: Number of time steps in the input sequence (e.g., 96 hours)
-    :param output_steps: Number of time steps in the output sequence (e.g., 240 hours)
-    :param feature_column: Column name for the target variable (e.g., 'cnt')
-    :return: Input and output sequences as numpy arrays
-    """
     X, y = [], []
     for i in range(len(data) - input_steps - output_steps):
-        X.append(data.iloc[i:i + input_steps].values)  # Input sequence
-        y.append(data.iloc[i + input_steps:i + input_steps + output_steps][feature_column].values)  # Output sequence
+        X.append(data.iloc[i:i + input_steps].values)
+        y.append(data.iloc[i + input_steps:i + input_steps + output_steps][feature_column].values)
     return np.array(X), np.array(y)
 
 # Parameters
-input_steps = 96  # Past 96 hours
-output_steps = 240  # Short-term prediction (future 240 hours)
+input_steps = 96  # 输入时间步长：96小时
+output_steps = 240  # 输出时间步长：240小时
 target_column = 'cnt'
 
 # Generate sequences for training and testing
@@ -63,59 +74,93 @@ y_train = torch.tensor(y_train, dtype=torch.float32)
 X_test = torch.tensor(X_test, dtype=torch.float32)
 y_test = torch.tensor(y_test, dtype=torch.float32)
 
+# Positional Encoding
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=0.1)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+# Transformer Model
 class TransformerModel(nn.Module):
-    def __init__(self, input_size, hidden_size, output_steps, num_layers=4, nhead=4):
+    def __init__(self, input_size, hidden_size, output_steps, num_layers=6, nhead=8):
         super(TransformerModel, self).__init__()
         self.encoder = nn.Linear(input_size, hidden_size)
+        self.pos_encoder = PositionalEncoding(hidden_size)
         self.transformer = nn.Transformer(
             d_model=hidden_size,
             nhead=nhead,
             num_encoder_layers=num_layers,
             num_decoder_layers=num_layers,
             dim_feedforward=hidden_size * 4,
-            dropout=0.1,
+            dropout=0.2,
             batch_first=True
         )
         self.fc = nn.Linear(hidden_size, 1)
         self.output_steps = output_steps
     
     def forward(self, x):
+        # 编码输入
         x = self.encoder(x)
-        decoder_input = x[:, -self.output_steps:, :]  # 使用输入序列的最后一部分作为解码器输入
+        x = self.pos_encoder(x)
+        
+        # 创建解码器输入（初始为全零）
+        batch_size = x.size(0)
+        decoder_input = torch.zeros(batch_size, self.output_steps, x.size(2)).to(x.device)
+        
+        # 将编码器输出和解码器输入传递给Transformer
         out = self.transformer(x, decoder_input)
+        
+        # 通过全连接层映射到输出维度
         out = self.fc(out).squeeze(-1)
         return out
-
 # Parameters for experiments
 n_experiments = 5
 mse_results = []
 mae_results = []
 
+# EarlyStopping实例化
+early_stopping = EarlyStopping(patience=5, delta=0.001)
+
 for i in range(n_experiments):
     print(f"Experiment {i + 1}/{n_experiments}...")
-    
+
     # Convert to PyTorch DataLoader
     train_dataset = TensorDataset(X_train, y_train)
     test_dataset = TensorDataset(X_test, y_test)
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
-    
+
     # Build the model
     input_size = X_train.shape[2]
-    hidden_size = 128
+    hidden_size = 512
     model = TransformerModel(input_size, hidden_size, output_steps)
-    
+
     # Move model to GPU if available
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
-    
+
     # Define loss and optimizer
-    criterion = nn.L1Loss()
-    optimizer = optim.Adam(model.parameters(), lr=0.0001)
-    
+    criterion = nn.SmoothL1Loss()
+    optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
+
     # Train the model
-    for epoch in tqdm(range(50), desc="Training Epochs", leave=False):  # 增加训练轮数
+    train_losses = []
+    val_losses = []
+    for epoch in tqdm(range(50), desc="Training Epochs", leave=False):
         model.train()
+        epoch_loss = 0
         for batch_X, batch_y in train_loader:
             batch_X, batch_y = batch_X.to(device), batch_y.to(device)
             optimizer.zero_grad()
@@ -123,7 +168,37 @@ for i in range(n_experiments):
             loss = criterion(outputs, batch_y)
             loss.backward()
             optimizer.step()
-    
+            epoch_loss += loss.item()
+        train_losses.append(epoch_loss / len(train_loader))
+
+        # 验证集损失
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch_X, batch_y in test_loader:
+                batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                outputs = model(batch_X)
+                val_loss += criterion(outputs, batch_y).item()
+        val_losses.append(val_loss / len(test_loader))
+
+        # 检查是否需要早停
+        if early_stopping.should_stop(val_loss / len(test_loader)):
+            print(f"Early stopping at epoch {epoch + 1}")
+            break
+
+        scheduler.step(val_loss)  # 根据验证集损失调整学习率
+
+    # 绘制训练和验证损失曲线
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Training and Validation Loss')
+    plt.savefig('/data/kangw/work/ML/data/Transformer_graph_240h_Loss.png')
+    plt.show()
+
     # Evaluate the model on the test set
     model.eval()
     y_pred_list = []
@@ -134,13 +209,13 @@ for i in range(n_experiments):
             outputs = model(batch_X)
             y_pred_list.append(outputs.cpu().numpy())
             y_true_list.append(batch_y.cpu().numpy())
-    
+
     y_pred = np.concatenate(y_pred_list)
     y_true = np.concatenate(y_true_list)
-    
+
     mse = mean_squared_error(y_true.flatten(), y_pred.flatten())
     mae = mean_absolute_error(y_true.flatten(), y_pred.flatten())
-    
+
     mse_results.append(mse)
     mae_results.append(mae)
 
@@ -156,21 +231,14 @@ print(f"MSE: Mean = {mse_mean:.4f}, Std = {mse_std:.4f}")
 print(f"MAE: Mean = {mae_mean:.4f}, Std = {mae_std:.4f}")
 
 # 可视化第一个测试样本的真实值和预测值
-plt.figure(figsize=(15, 6))
-
-# 提取完整的真实值（0-336 小时）
-true_values = test_data_normalized[target_column].values[:336]
-
-# 绘制真实值（0-336）
-plt.plot(range(0, 336), true_values, label='Ground Truth (0-336)', color='blue', linewidth=2)
-
-# 绘制预测值（96-336）
+plt.figure(figsize=(10, 6))
+true_values = test_data_normalized[target_column].values[96:336]  # 真实值时间范围为0-336小时
+plt.plot(range(96, 336), true_values, label='Ground Truth (0-336)', color='blue', linewidth=2)
 plt.plot(range(96, 336), y_pred[0], label='Prediction (96-336)', color='orange', linestyle='dashed', linewidth=2)
-
 plt.title('Bike Rental Prediction vs Ground Truth (240 Hours)', fontsize=16)
 plt.xlabel('Time Steps (Hours)', fontsize=14)
 plt.ylabel('Rental Count', fontsize=14)
 plt.legend(fontsize=12)
 plt.grid(True)
-plt.savefig('/public/home/xiangyuduan/kwang/ml/data/Transformer_graph_240h_test.png')
+plt.savefig('/data/kangw/work/ML/data/Transformer_graph_240h_test.png')
 plt.show()
